@@ -2,20 +2,20 @@ use io_partition::clone_into_vec;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
-use std::io;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, Write, SeekFrom};
+use std::io::Error as IOError;
 
 #[derive(Debug)]
 /// List all possible error that ``Sir0`` can return
 pub enum Sir0Error {
     /// An error happened while performing an IO operation on a file
-    IOError(io::Error),
+    IOError(IOError),
     /// The magic of the Sir0 file does not correspond to what is expected
     InvalidMagic([u8; 4]),
     /// Impossible to create a partition of a file
-    CreatePartitionError(io::Error),
+    CreatePartitionError(IOError),
     /// Impossible to clone a part of a file
-    CloneHeaderError(io::Error),
+    CloneHeaderError(IOError),
 }
 
 impl Error for Sir0Error {
@@ -48,8 +48,8 @@ impl Display for Sir0Error {
     }
 }
 
-impl From<io::Error> for Sir0Error {
-    fn from(err: io::Error) -> Sir0Error {
+impl From<IOError> for Sir0Error {
+    fn from(err: IOError) -> Sir0Error {
         Sir0Error::IOError(err)
     }
 }
@@ -146,4 +146,42 @@ impl<T: Read + Seek> Sir0<T> {
     pub fn get_file(&mut self) -> &mut T {
         &mut self.file
     }
+}
+
+/// Write a sir0 footer, pointing to the various element in the list.
+/// The element of the list is based on the posititon since the start of the file. For a normal Sir0 file, the first 2 element should be [4, 8]
+#[allow(dead_code)]
+pub fn write_sir0_footer<T>(file: &mut T, list: Vec<u32>) -> Result<(), IOError>
+where
+    T: Write,
+{
+    let mut latest_written_pointer = 0;
+    for original_to_write in list {
+        let mut remaining_to_write = original_to_write - latest_written_pointer;
+        latest_written_pointer = original_to_write;
+        let mut reversed_to_write = Vec::new();
+        if remaining_to_write == 0 {
+            //NOTE: this never happen in original game. This is an extrapolation of what will need to be written in such a situation.
+            reversed_to_write.push(0);
+        } else {
+            loop {
+                if remaining_to_write >= 128 {
+                    let to_write = (remaining_to_write % 128) as u8;
+                    remaining_to_write >>= 7;
+                    reversed_to_write.push(to_write);
+                } else {
+                    reversed_to_write.push(remaining_to_write as u8);
+                    break;
+                }
+            }
+        }
+        for (counter, value_to_write) in reversed_to_write.iter().cloned().enumerate().rev() {
+            if counter == 0 {
+                file.write_all(&[value_to_write])?;
+            } else {
+                file.write_all(&[value_to_write + 0b1000_0000])?;
+            }
+        }
+    }
+    Ok(())
 }

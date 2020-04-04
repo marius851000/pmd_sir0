@@ -5,3 +5,4 @@
 
 mod sir0;
 pub use sir0::{Sir0, Sir0Error};
+pub use sir0::write_sir0_footer;
