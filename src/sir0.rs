@@ -1,58 +1,26 @@
+use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use io_partition::clone_into_vec;
-use std::error::Error;
-use std::fmt;
-use std::fmt::Display;
-use std::io::{Read, Seek, Write, SeekFrom};
 use std::io::Error as IOError;
-use byteorder::{LE, ReadBytesExt, WriteBytesExt};
+use std::io::{Read, Seek, SeekFrom, Write};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 /// List all possible error that ``Sir0`` can return
 pub enum Sir0Error {
-    /// An error happened while performing an IO operation on a file
-    IOError(IOError),
-    /// The magic b"SIR0" of the Sir0 file does not correspond to what is expected
+    #[error("An error happened while performing an IO operation")]
+    IOError(#[from] IOError),
+    #[error("The magic of the Sir0 file is not reconized: found {0:?}")]
     InvalidMagic([u8; 4]),
-    /// Impossible to create a partition of a file
-    CreatePartitionError(IOError),
-    /// Impossible to clone a part of a file
-    CloneHeaderError(IOError),
-}
-
-impl Error for Sir0Error {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::IOError(err) | Self::CreatePartitionError(err) | Self::CloneHeaderError(err) => {
-                Some(err)
-            }
-            Self::InvalidMagic(_) => None,
-        }
-    }
-}
-
-impl Display for Sir0Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IOError(_) => write!(f, "An error happened while performing an IO operation"),
-            Self::InvalidMagic(magic) => write!(
-                f,
-                "The magic of the Sir0 file is not reconized: found {:?}",
-                magic
-            ),
-            Self::CreatePartitionError(_) => {
-                write!(f, "An error happened while creating a partition of a file")
-            }
-            Self::CloneHeaderError(_) => {
-                write!(f, "An error happened while cloning a partition of a file")
-            }
-        }
-    }
-}
-
-impl From<IOError> for Sir0Error {
-    fn from(err: IOError) -> Sir0Error {
-        Sir0Error::IOError(err)
-    }
+    #[error("An error happened while creating a partition of a file")]
+    CreatePartitionError(#[source] IOError),
+    #[error("An error happened while cloning a partition of a file")]
+    CloneHeaderError(#[source] IOError),
+    #[error("the sir0 file indicate that the pointer list of the file is at offset {1}, but that the header is at {0}, after the pointer list.")]
+    PointerBeforeHeader(u32, u32),
+    #[error("the offset of the pointer list ({0}) is too big: it is either past or at the end of file ({1})")]
+    PointerOffsetPostOrAtFileEnd(u64, u64),
+    #[error("the absolute position represented by the sir0 offset overflow the maximal capacity of an unsigned interget of 64 bit (absolute position: {0}, sum to add: {1}).")]
+    AbsolutePointerOverflow(u64, u64),
 }
 
 /// A Sir0 file, used in pokémon mystery dungeon on 3ds and DS (only tested with the 3ds version)
@@ -77,7 +45,15 @@ impl<T: Read + Seek> Sir0<T> {
         let header_offset = file.read_u32::<LE>()?;
         let pointer_offset = file.read_u32::<LE>()?;
 
-        let header_lenght = pointer_offset - header_offset;
+        let header_lenght = pointer_offset.checked_sub(header_offset).map_or_else(
+            || {
+                Err(Sir0Error::PointerBeforeHeader(
+                    header_offset,
+                    pointer_offset,
+                ))
+            },
+            Ok,
+        )?;
 
         let header = clone_into_vec(&mut file, header_offset as u64, header_lenght as u64)
             .map_err(Sir0Error::CloneHeaderError)?;
@@ -90,21 +66,54 @@ impl<T: Read + Seek> Sir0<T> {
         let mut is_constructing = false;
         let mut constructed_pointer: u64 = 0;
         let mut absolute_position: u64 = 0;
-        for _ in 0..(file_lenght - (pointer_offset as u64) - 1) {
+        let remaining_bytes = file_lenght
+            .checked_sub(pointer_offset as u64)
+            .map(|n| n.checked_sub(1))
+            .flatten()
+            .map_or_else(
+                || {
+                    Err(Sir0Error::PointerOffsetPostOrAtFileEnd(
+                        pointer_offset as u64,
+                        file_lenght,
+                    ))
+                },
+                Ok,
+            )?;
+        for _ in 0..remaining_bytes {
             let current = file.read_u8()?;
             if current >= 128 {
                 is_constructing = true;
-                constructed_pointer = (constructed_pointer << 7) | ((current & 0x7F) as u64);
+                constructed_pointer =
+                    constructed_pointer.overflowing_shl(7).0 | ((current & 0x7F) as u64);
             } else if is_constructing {
-                constructed_pointer = (constructed_pointer << 7) | ((current & 0x7F) as u64);
-                absolute_position += constructed_pointer;
+                constructed_pointer =
+                    constructed_pointer.overflowing_shl(7).0 | ((current & 0x7F) as u64);
+                absolute_position = absolute_position
+                    .checked_add(constructed_pointer)
+                    .map_or_else(
+                        || {
+                            Err(Sir0Error::AbsolutePointerOverflow(
+                                absolute_position,
+                                constructed_pointer,
+                            ))
+                        },
+                        Ok,
+                    )?;
                 absolute_pointers.push(absolute_position);
                 is_constructing = false;
                 constructed_pointer = 0;
             } else if current == 0 {
                 break;
             } else {
-                absolute_position += current as u64;
+                absolute_position = absolute_position.checked_add(current as u64).map_or_else(
+                    || {
+                        Err(Sir0Error::AbsolutePointerOverflow(
+                            absolute_position,
+                            current as u64,
+                        ))
+                    },
+                    Ok,
+                )?;
                 absolute_pointers.push(absolute_position);
             }
         }
@@ -138,25 +147,48 @@ impl<T: Read + Seek> Sir0<T> {
 }
 
 /// write the sir0 header at the current position of the file. It should be written at the beggining of the file, but require to know the header and offset list offset.
-/// 
+///
 /// It have a constant size of 12 bytes, so you should reserve 12 bytes at the beggining of the file, write it, write the header at the end of it, call [`write_sir0_footer`],
 /// seek at the beggining of the file and call this function.
-pub fn write_sir0_header(file: &mut impl Write, header_offset: u32, offset_offset: u32) -> Result<(), IOError> {
+pub fn write_sir0_header(
+    file: &mut impl Write,
+    header_offset: u32,
+    offset_offset: u32,
+) -> Result<(), IOError> {
     file.write_all(&[b'S', b'I', b'R', b'0'])?;
     file.write_u32::<LE>(header_offset)?;
     file.write_u32::<LE>(offset_offset)?;
     Ok(())
 }
 
+/// An error that occured while writing a sir0 footer
+#[derive(Error, Debug)]
+pub enum Sir0WriteFooterError {
+    #[error("an error occured while writing the file")]
+    IOError(#[from] IOError),
+    #[error("an element in the isn't sorted nicely. They need to be smaller from the bigger to the biggest. ( {0} is bigger than {1}")]
+    NotSorted(u32, u32),
+}
+
 /// Write a sir0 footer, pointing to the various element in the list.
 /// The element of the list is based on the posititon since the start of the file. For a normal Sir0 file, the first 2 element should be [4, 8]
-pub fn write_sir0_footer<T>(file: &mut T, list: Vec<u32>) -> Result<(), IOError>
+pub fn write_sir0_footer<T>(file: &mut T, list: &[u32]) -> Result<(), Sir0WriteFooterError>
 where
     T: Write,
 {
     let mut latest_written_pointer = 0;
-    for original_to_write in list {
-        let mut remaining_to_write = original_to_write - latest_written_pointer;
+    for original_to_write in list.to_owned() {
+        let mut remaining_to_write = original_to_write
+            .checked_sub(latest_written_pointer)
+            .map_or_else(
+                || {
+                    Err(Sir0WriteFooterError::NotSorted(
+                        original_to_write,
+                        latest_written_pointer,
+                    ))
+                },
+                Ok,
+            )?;
         latest_written_pointer = original_to_write;
         let mut reversed_to_write = Vec::new();
         if remaining_to_write == 0 {
