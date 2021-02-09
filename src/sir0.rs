@@ -4,13 +4,14 @@ use std::fmt;
 use std::fmt::Display;
 use std::io::{Read, Seek, Write, SeekFrom};
 use std::io::Error as IOError;
+use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 
 #[derive(Debug)]
 /// List all possible error that ``Sir0`` can return
 pub enum Sir0Error {
     /// An error happened while performing an IO operation on a file
     IOError(IOError),
-    /// The magic of the Sir0 file does not correspond to what is expected
+    /// The magic b"SIR0" of the Sir0 file does not correspond to what is expected
     InvalidMagic([u8; 4]),
     /// Impossible to create a partition of a file
     CreatePartitionError(IOError),
@@ -63,18 +64,6 @@ pub struct Sir0<T: Read + Seek> {
     file: T,
 }
 
-fn read_sir0_u32<T: Read>(file: &mut T) -> Result<u32, Sir0Error> {
-    let mut buf = [0; 4];
-    file.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_sir0_u8<T: Read>(file: &mut T) -> Result<u8, Sir0Error> {
-    let mut buf = [0; 1];
-    file.read_exact(&mut buf)?;
-    Ok(u8::from_le_bytes(buf))
-}
-
 impl<T: Read + Seek> Sir0<T> {
     /// Create a new Sir0 from the file.
     pub fn new(mut file: T) -> Result<Self, Sir0Error> {
@@ -85,8 +74,8 @@ impl<T: Read + Seek> Sir0<T> {
             return Err(Sir0Error::InvalidMagic(magic));
         };
 
-        let header_offset = read_sir0_u32(&mut file)?;
-        let pointer_offset = read_sir0_u32(&mut file)?;
+        let header_offset = file.read_u32::<LE>()?;
+        let pointer_offset = file.read_u32::<LE>()?;
 
         let header_lenght = pointer_offset - header_offset;
 
@@ -102,7 +91,7 @@ impl<T: Read + Seek> Sir0<T> {
         let mut constructed_pointer: u64 = 0;
         let mut absolute_position: u64 = 0;
         for _ in 0..(file_lenght - (pointer_offset as u64) - 1) {
-            let current = read_sir0_u8(&mut file)?;
+            let current = file.read_u8()?;
             if current >= 128 {
                 is_constructing = true;
                 constructed_pointer = (constructed_pointer << 7) | ((current & 0x7F) as u64);
@@ -148,9 +137,19 @@ impl<T: Read + Seek> Sir0<T> {
     }
 }
 
+/// write the sir0 header at the current position of the file. It should be written at the beggining of the file, but require to know the header and offset list offset.
+/// 
+/// It have a constant size of 12 bytes, so you should reserve 12 bytes at the beggining of the file, write it, write the header at the end of it, call [`write_sir0_footer`],
+/// seek at the beggining of the file and call this function.
+pub fn write_sir0_header(file: &mut impl Write, header_offset: u32, offset_offset: u32) -> Result<(), IOError> {
+    file.write_all(&[b'S', b'I', b'R', b'0'])?;
+    file.write_u32::<LE>(header_offset)?;
+    file.write_u32::<LE>(offset_offset)?;
+    Ok(())
+}
+
 /// Write a sir0 footer, pointing to the various element in the list.
 /// The element of the list is based on the posititon since the start of the file. For a normal Sir0 file, the first 2 element should be [4, 8]
-#[allow(dead_code)]
 pub fn write_sir0_footer<T>(file: &mut T, list: Vec<u32>) -> Result<(), IOError>
 where
     T: Write,
