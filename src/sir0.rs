@@ -192,8 +192,7 @@ where
         latest_written_pointer = original_to_write;
         let mut reversed_to_write = Vec::new();
         if remaining_to_write == 0 {
-            //NOTE: this never happen in original game. This is an extrapolation of what will need to be written in such a situation.
-            reversed_to_write.push(0);
+            continue
         } else {
             loop {
                 if remaining_to_write >= 128 {
